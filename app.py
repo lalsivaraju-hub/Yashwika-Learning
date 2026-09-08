@@ -1,6 +1,20 @@
 """
 My Learning Adventure - a colourful, parent-moderated daily learning
 companion for a young child (built for UKG / CBSE, but adaptable).
+
+ADAPTIVE ENGINE (this version):
+Each day, for each subject slot, the app tries, in order:
+  1. Ask Gemini to generate a BRAND-NEW exercise, tailored to everything
+     known so far about the child's learning in that subject - approved
+     worksheet uploads (with OCR text + optional Gemini picture
+     descriptions), parent-typed "what she has learned" notes, and recent
+     mission ratings/feedback. Gemini also recommends whether tomorrow's
+     difficulty should increase, stay the same, or decrease, which is
+     stored per-section and fed back into tomorrow's prompt.
+  2. If no API key is configured, or the Gemini call fails for any
+     reason, fall back to rotating through approved uploaded topics.
+  3. If neither is available, fall back to a small built-in generic
+     CBSE/UKG activity bank, so there is always something to do.
 """
 
 import hashlib
@@ -27,6 +41,10 @@ DB_PATH = DATA_DIR / "learning.db"
 
 DEFAULT_SECTIONS = ["Literacy (English)", "Hindi", "Kannada", "Numeracy", "Drawing"]
 LANGUAGE_DAY_ORDER = ["Hindi", "Kannada"]  # alternates by weekday
+SECTION_TO_LANGUAGE = {
+    "Literacy (English)": "English", "Hindi": "Hindi", "Kannada": "Kannada",
+    "Numeracy": "English", "Drawing": "English", "Speaking & Thinking": "English",
+}
 
 NAV_TODAY = "🏠 Today's Mission"
 NAV_LIBRARY = "📚 Learning Library"
@@ -46,6 +64,8 @@ st.markdown(
                margin:12px 0; box-shadow:0 5px 18px rgba(0,0,0,.06); }
     .source-tag { display:inline-block; background:#f0ebff; color:#5a3fd6; border-radius:999px;
                   padding:2px 10px; font-size:.78rem; font-weight:700; margin-bottom:6px; }
+    .level-tag { display:inline-block; background:#eafff2; color:#1a9c5b; border-radius:999px;
+                 padding:2px 10px; font-size:.78rem; font-weight:700; margin-left:6px; }
     .stButton>button { border:0; border-radius:16px; background:#7657ff; color:white; font-weight:700; }
     [data-testid='stSidebar'] { background:#fff9fd; }
     </style>
@@ -55,8 +75,7 @@ st.markdown(
 
 
 # ----------------------------------------------------------------------------
-# Generic exercise bank - always available, even with zero uploads
-# (This is what makes "Today's Mission" work from day one.)
+# Generic exercise bank - the last-resort fallback, always available
 # ----------------------------------------------------------------------------
 GENERIC_BANK = {
     "Literacy (English)": [
@@ -111,6 +130,10 @@ MISSION_SLOTS = [
     ("Speaking & Thinking", 3, 10),
 ]
 
+CONTEXT_UPLOAD_LIMIT = 4       # most recent approved uploads per section fed to Gemini
+CONTEXT_MISSION_LIMIT = 8      # most recent past missions per section fed to Gemini
+RAW_TEXT_SNIPPET_LEN = 300     # trim long OCR text before sending to Gemini
+
 
 # ----------------------------------------------------------------------------
 # Database helpers
@@ -119,6 +142,12 @@ def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _add_column_if_missing(conn, table, column, ddl_type_and_default):
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type_and_default}")
 
 
 def init_db():
@@ -156,6 +185,17 @@ def init_db():
                 try_next TEXT, encouragement TEXT,
                 rating INTEGER, feedback TEXT
             );
+            CREATE TABLE IF NOT EXISTS learning_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                section TEXT, note TEXT, added_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS section_levels (
+                section TEXT PRIMARY KEY,
+                level INTEGER DEFAULT 1,
+                last_topic TEXT,
+                last_rationale TEXT,
+                updated_at TEXT
+            );
             """
         )
         if not conn.execute("SELECT 1 FROM profile WHERE id = 1").fetchone():
@@ -165,15 +205,12 @@ def init_db():
                 ("My Star", "2020-01-01", "UKG", "animals, colours, stories",
                  hashlib.sha256(b"2468").hexdigest()),
             )
-        # Lightweight migration: add AI columns if this is an older database.
-        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(profile)")}
-        if "gemini_api_key" not in existing_cols:
-            conn.execute("ALTER TABLE profile ADD COLUMN gemini_api_key TEXT DEFAULT ''")
-        if "gemini_model" not in existing_cols:
-            conn.execute(
-                f"ALTER TABLE profile ADD COLUMN gemini_model TEXT DEFAULT "
-                f"'{gemini_helper.DEFAULT_MODEL}'"
-            )
+        # Lightweight migrations for databases created by earlier app versions.
+        _add_column_if_missing(conn, "profile", "gemini_api_key", "TEXT DEFAULT ''")
+        _add_column_if_missing(conn, "profile", "gemini_model",
+                                f"TEXT DEFAULT '{gemini_helper.DEFAULT_MODEL}'")
+        _add_column_if_missing(conn, "resources", "ai_description", "TEXT DEFAULT ''")
+
         for section in DEFAULT_SECTIONS:
             conn.execute("INSERT OR IGNORE INTO sections (name) VALUES (?)", (section,))
 
@@ -211,22 +248,6 @@ def get_total_points():
     return row["total"]
 
 
-def get_ai_config():
-    """Returns (api_key, model). Streamlit secrets (cloud) take priority
-    over the locally stored key, so a cloud deployment can use a secret
-    without a parent needing to re-enter the key in the UI."""
-    profile_row = get_profile()
-    try:
-        secret_key = st.secrets.get("GEMINI_API_KEY", "")
-    except Exception:
-        # No secrets.toml file present at all (normal for local runs) -
-        # this is expected and not an error condition.
-        secret_key = ""
-    api_key = secret_key or profile_row.get("gemini_api_key") or ""
-    model = profile_row.get("gemini_model") or gemini_helper.DEFAULT_MODEL
-    return api_key, model
-
-
 def get_badge(points):
     if points >= 1000:
         return "🏆 Learning Legend"
@@ -239,9 +260,131 @@ def get_badge(points):
     return "🌱 Little Sprout"
 
 
+def get_ai_config():
+    """Returns (api_key, model). Streamlit secrets (cloud) take priority
+    over the locally stored key, so a cloud deployment can use a secret
+    without a parent needing to re-enter the key in the UI."""
+    profile_row = get_profile()
+    try:
+        secret_key = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        # No secrets.toml present at all - normal for local runs, not an error.
+        secret_key = ""
+    api_key = secret_key or profile_row.get("gemini_api_key") or ""
+    model = profile_row.get("gemini_model") or gemini_helper.DEFAULT_MODEL
+    return api_key, model
+
+
+def get_section_level(section):
+    row = fetch_one("SELECT * FROM section_levels WHERE section = ?", (section,))
+    if row:
+        return dict(row)
+    return {"section": section, "level": 1, "last_topic": "", "last_rationale": "", "updated_at": ""}
+
+
+def update_section_level(section, difficulty_next, topic_covered, rationale):
+    current = get_section_level(section)
+    level = current["level"]
+    if difficulty_next == "increase":
+        level = min(level + 1, 10)
+    elif difficulty_next == "decrease":
+        level = max(level - 1, 1)
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO section_levels (section, level, last_topic, last_rationale, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(section) DO UPDATE SET
+                 level=excluded.level, last_topic=excluded.last_topic,
+                 last_rationale=excluded.last_rationale, updated_at=excluded.updated_at""",
+            (section, level, topic_covered, rationale, datetime.now().isoformat(timespec="seconds")),
+        )
+
+
 # ----------------------------------------------------------------------------
-# Daily mission generation
+# Adaptive learning context builder
 # ----------------------------------------------------------------------------
+def build_learning_context(section):
+    """
+    Gathers everything the app knows about the child's progress in
+    `section` into one plain-text summary, to hand to Gemini so it can
+    generate a genuinely tailored, non-repetitive exercise:
+      - approved worksheet uploads (topic + OCR text + Gemini description)
+      - parent-typed "what she has learned so far" notes
+      - recent completed missions with parent ratings/feedback
+    """
+    parts = []
+
+    uploads = fetch_all(
+        "SELECT * FROM resources WHERE section = ? AND approved = 1 ORDER BY id DESC LIMIT ?",
+        (section, CONTEXT_UPLOAD_LIMIT),
+    )
+    if uploads:
+        parts.append("Approved worksheets covered so far:")
+        for u in uploads:
+            snippet = (u["raw_text"] or "").strip().replace("\n", " ")[:RAW_TEXT_SNIPPET_LEN]
+            line = f"- Topic: {u['topic']}"
+            if u["ai_description"]:
+                line += f" | Picture description: {u['ai_description']}"
+            if snippet:
+                line += f" | Text on page: {snippet}"
+            parts.append(line)
+
+    notes = fetch_all(
+        "SELECT * FROM learning_notes WHERE section = ? ORDER BY id DESC LIMIT 10", (section,)
+    )
+    if notes:
+        parts.append("\nParent notes on what she has learned / can already do:")
+        for n in notes:
+            parts.append(f"- ({n['added_at'][:10]}) {n['note']}")
+
+    history = fetch_all(
+        """SELECT * FROM missions WHERE section = ? AND status = 'done'
+           ORDER BY id DESC LIMIT ?""",
+        (section, CONTEXT_MISSION_LIMIT),
+    )
+    if history:
+        parts.append("\nRecent completed activities in this subject:")
+        for m in history:
+            line = f"- {m['title']}"
+            if m["rating"]:
+                line += f" (parent rating: {m['rating']}/5)"
+            if m["feedback"]:
+                line += f" - parent feedback: {m['feedback']}"
+            parts.append(line)
+
+    return "\n".join(parts)
+
+
+def try_generate_gemini_mission(section, minutes, points, day_seed):
+    """Attempts adaptive generation via Gemini. Returns a mission tuple or
+    None if unavailable/failed, so the caller can fall back gracefully."""
+    api_key, model = get_ai_config()
+    if not api_key:
+        return None
+
+    language = SECTION_TO_LANGUAGE.get(section, "English")
+    context = build_learning_context(section)
+    level_info = get_section_level(section)
+
+    result = gemini_helper.generate_exercise(
+        api_key, model, section, language, context, minutes, points, level_info["level"]
+    )
+    if not result.get("ok"):
+        return None
+
+    title = result["title"]
+    instructions = result["instructions"]
+    if not title or not instructions:
+        return None
+
+    update_section_level(
+        section, result.get("difficulty_next", "same"),
+        result.get("topic_covered", ""), result.get("rationale", ""),
+    )
+    source = f"🤖 Gemini • tailored to level {get_section_level(section)['level']}/10"
+    return title, instructions, source
+
+
 def pick_from_generic(section, seed):
     bank = GENERIC_BANK.get(section, [])
     if not bank:
@@ -267,30 +410,57 @@ def pick_from_uploads(section, seed):
 
 
 def build_todays_missions(day):
+    """
+    NOTE ON DB LOCKING: generation (especially the Gemini path, which
+    itself writes to section_levels via update_section_level) is
+    deliberately done BEFORE opening a connection for the mission
+    INSERTs below. SQLite does not handle a write connection staying
+    open while a nested call opens and writes through a second
+    connection - doing so raises 'database is locked'. Keeping
+    generation and the final write phase separate avoids that.
+    """
     day_str = day.isoformat()
     seed = day.toordinal()
     language_for_day = LANGUAGE_DAY_ORDER[day.weekday() % 2]
 
+    slots_needed = []
+    for section_key, minutes, points in MISSION_SLOTS:
+        section = language_for_day if section_key == "__LANGUAGE__" else section_key
+        existing = fetch_one(
+            "SELECT 1 FROM missions WHERE day = ? AND section = ?", (day_str, section)
+        )
+        if not existing:
+            slots_needed.append((section, minutes, points))
+
+    generated = []
+    for section, minutes, points in slots_needed:
+        result = (
+            try_generate_gemini_mission(section, minutes, points, seed)
+            or pick_from_uploads(section, seed)
+            or pick_from_generic(section, seed)
+        )
+        if result is not None:
+            generated.append((section, minutes, points, result))
+
+    if generated:
+        with get_conn() as conn:
+            for section, minutes, points, (title, instructions, source) in generated:
+                conn.execute(
+                    """INSERT OR IGNORE INTO missions
+                       (day, section, title, instructions, minutes, points, source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (day_str, section, title, instructions, minutes, points, source),
+                )
+
+
+def regenerate_open_missions(day):
+    """Clears not-yet-completed missions for `day` so the next page load
+    regenerates them using current settings (e.g. a newly-added Gemini
+    key). Completed missions and their earned points are left untouched."""
     with get_conn() as conn:
-        for section_key, minutes, points in MISSION_SLOTS:
-            section = language_for_day if section_key == "__LANGUAGE__" else section_key
-
-            existing = conn.execute(
-                "SELECT 1 FROM missions WHERE day = ? AND section = ?", (day_str, section)
-            ).fetchone()
-            if existing:
-                continue
-
-            result = pick_from_uploads(section, seed) or pick_from_generic(section, seed)
-            if result is None:
-                continue
-            title, instructions, source = result
-            conn.execute(
-                """INSERT OR IGNORE INTO missions
-                   (day, section, title, instructions, minutes, points, source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (day_str, section, title, instructions, minutes, points, source),
-            )
+        conn.execute(
+            "DELETE FROM missions WHERE day = ? AND status != 'done'", (day.isoformat(),)
+        )
 
 
 def complete_mission(mission_id, points, title):
@@ -312,7 +482,7 @@ total_points = get_total_points()
 
 st.markdown(
     f"""<div class="hero"><h1>🌈 {profile['name']}'s Learning Adventure</h1>
-    <p>A playful 30-minute weekday journey, made just for her.</p></div>""",
+    <p>A playful 30-minute weekday journey that grows with her.</p></div>""",
     unsafe_allow_html=True,
 )
 
@@ -324,6 +494,11 @@ col3.metric("📚 Level", f"{profile['grade']} • Age {age_years(profile['birth
 with st.sidebar:
     page = st.radio("🧭 Choose a space", NAV_OPTIONS)
     st.caption("First-use parent PIN: 2468 (change it in Parent Studio).")
+    ai_key_check, _ = get_ai_config()
+    if ai_key_check:
+        st.success("🤖 Gemini AI: connected")
+    else:
+        st.info("🤖 Gemini AI: not connected (Parent Studio → AI Setup)")
 
 
 # ----------------------------------------------------------------------------
@@ -350,9 +525,11 @@ if page == NAV_TODAY:
         st.warning("No missions could be generated. Please check the Parent Studio settings.")
 
     for m in missions:
+        level = get_section_level(m["section"])
         st.markdown(
             f"""<div class="mission">
-            <span class="source-tag">{m['source']}</span><br/>
+            <span class="source-tag">{m['source']}</span>
+            <span class="level-tag">Level {level['level']}/10</span><br/>
             <b>{m['section']} • {m['minutes']} min • +{m['points']} points</b>
             <h3>{m['title']}</h3><p>{m['instructions']}</p></div>""",
             unsafe_allow_html=True,
@@ -368,13 +545,14 @@ if page == NAV_TODAY:
 
 
 # ----------------------------------------------------------------------------
-# Page: Learning Library (upload + OCR)
+# Page: Learning Library (upload + OCR + Gemini description + learning notes)
 # ----------------------------------------------------------------------------
 elif page == NAV_LIBRARY:
     st.subheader("📚 School Book & Activity Library")
     st.write(
-        "Upload a photo or PDF of a worksheet. The app will try to **read the printed "
-        "text automatically** using OCR and suggest a topic - you can edit it before saving."
+        "Upload a photo or PDF of a worksheet. The app reads printed text "
+        "automatically (OCR) and, with Gemini connected, can also understand "
+        "pictures. Everything approved here feeds the daily adaptive missions."
     )
 
     section = st.selectbox("Section", get_sections())
@@ -389,18 +567,18 @@ elif page == NAV_LIBRARY:
     suggested_topic = ""
     combined_text = ""
     language_hint = ""
+    ai_description = ""
     ai_key, ai_model = get_ai_config()
 
     if files:
         with st.spinner("Reading the worksheet..."):
-            texts = []
-            langs = []
+            texts, langs = [], []
             for f in files:
                 try:
                     result = ocr_utils.analyse_upload(f.getvalue(), f.name, section)
                     texts.append(result["raw_text"])
                     langs.append(result["language_hint"])
-                except Exception as exc:  # keep upload usable even if OCR fails
+                except Exception as exc:
                     st.warning(f"Could not read text from {f.name} automatically ({exc}). "
                                f"You can still type the topic manually below.")
             combined_text = "\n".join(t for t in texts if t)
@@ -410,12 +588,12 @@ elif page == NAV_LIBRARY:
 
         if combined_text:
             with st.expander("🔎 What the app read from this page (tap to check accuracy)"):
-                st.text(combined_text[:1500] if combined_text else "(no text found)")
+                st.text(combined_text[:1500])
                 st.caption(f"Detected language: {language_hint or 'unknown'}. "
                            "OCR reads printed text only - it cannot see pictures or handwriting.")
         else:
-            st.info("No printed text was detected (this is normal for picture-only or "
-                     "handwritten pages). Please type the topic manually below.")
+            st.info("No printed text was detected (normal for picture-only or handwritten "
+                     "pages). Please type the topic manually below, or use Gemini below.")
 
         st.markdown("---")
         if not ai_key:
@@ -430,8 +608,9 @@ elif page == NAV_LIBRARY:
                         files[0].type or "image/jpeg", section, profile["grade"]
                     )
                 if result["ok"]:
+                    ai_description = result.get("description", "")
                     st.success("Gemini's description:")
-                    st.write(result.get("description", ""))
+                    st.write(ai_description)
                     if result.get("questions"):
                         st.caption("Suggested questions to ask your child:")
                         for q in result["questions"]:
@@ -462,20 +641,58 @@ elif page == NAV_LIBRARY:
                     path.write_bytes(f.getbuffer())
                     conn.execute(
                         """INSERT INTO resources
-                           (section, title, topic, raw_text, language_hint, path, added)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                           (section, title, topic, raw_text, language_hint, ai_description, path, added)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                         (section, title or f.name, topic, combined_text, language_hint,
-                         str(path), datetime.now().isoformat(timespec="seconds")),
+                         ai_description, str(path), datetime.now().isoformat(timespec="seconds")),
                     )
             st.success("Saved! A parent must approve it in Parent Studio before it "
-                       "appears in daily missions.")
+                       "shapes daily missions.")
             st.rerun()
+
+    st.divider()
+    st.subheader("📝 What has she learned so far?")
+    st.write(
+        "Type anything you know she can already do - this is used directly by Gemini "
+        "to avoid repeating things and to pick the right difficulty. No file needed."
+    )
+    note_section = st.selectbox("Which section is this note about?", get_sections(), key="note_section")
+    note_text = st.text_area(
+        "Learning note", key="note_text",
+        placeholder="e.g. She can count 1-20 confidently and knows 5 colours in Hindi, "
+                    "but mixes up 'b' and 'd' sometimes.",
+    )
+    if st.button("💾 Save learning note"):
+        if not note_text.strip():
+            st.error("Please type a short note first.")
+        else:
+            with get_conn() as conn:
+                conn.execute(
+                    "INSERT INTO learning_notes (section, note, added_at) VALUES (?, ?, ?)",
+                    (note_section, note_text.strip(), datetime.now().isoformat(timespec="seconds")),
+                )
+            st.success("Saved.")
+            st.rerun()
+
+    existing_notes = fetch_all(
+        "SELECT * FROM learning_notes WHERE section = ? ORDER BY id DESC LIMIT 10", (note_section,)
+    )
+    if existing_notes:
+        st.caption(f"Recent notes for {note_section}:")
+        for n in existing_notes:
+            note_col, del_col = st.columns([6, 1])
+            note_col.write(f"• ({n['added_at'][:10]}) {n['note']}")
+            if del_col.button("🗑️", key=f"delnote_{n['id']}"):
+                with get_conn() as conn:
+                    conn.execute("DELETE FROM learning_notes WHERE id = ?", (n["id"],))
+                st.rerun()
 
     st.divider()
     st.subheader("Approved topics currently guiding missions")
     approved = fetch_all("SELECT * FROM resources WHERE approved = 1 ORDER BY id DESC")
     if not approved:
-        st.caption("None yet - daily missions are using the built-in generic activity bank.")
+        st.caption("None yet - daily missions are using Gemini generation (if connected) "
+                   "or the built-in generic activity bank.")
     for r in approved[:20]:
         st.write(f"✅ **{r['section']}** • {r['topic']}")
 
@@ -508,7 +725,7 @@ elif page == NAV_HOMEWORK:
             placeholder="e.g. she gets confused with 'borrowing' in subtraction",
         )
         hw_file = st.file_uploader(
-            "Upload the homework question (photo or PDF page)",
+            "Upload the homework question (photo)",
             type=["png", "jpg", "jpeg", "webp"], key="hw_uploader",
         )
 
@@ -587,12 +804,22 @@ elif page == NAV_PROGRESS:
            FROM missions GROUP BY day ORDER BY day DESC LIMIT 30"""
     )
     if history:
-        st.dataframe([dict(r) for r in history], use_container_width=True, hide_index=True)
+        st.dataframe([dict(r) for r in history], width="stretch", hide_index=True)
     else:
         st.info("Complete the first mission to begin tracking progress.")
 
     st.markdown(f"### {get_badge(total_points)}")
     st.progress(min(total_points / 1000, 1.0), text=f"{total_points}/1000 points toward Learning Legend")
+
+    st.divider()
+    st.subheader("🎚️ Current adaptive difficulty by subject")
+    levels = fetch_all("SELECT * FROM section_levels ORDER BY section")
+    if not levels:
+        st.caption("No adaptive levels yet - complete a few Gemini-generated missions first.")
+    for lv in levels:
+        st.write(f"**{lv['section']}** — Level {lv['level']}/10")
+        if lv["last_rationale"]:
+            st.caption(f"Gemini's note: {lv['last_rationale']}")
 
 
 # ----------------------------------------------------------------------------
@@ -644,6 +871,9 @@ else:
                     if r["raw_text"]:
                         st.caption("Text the app read from this page:")
                         st.text(r["raw_text"][:800])
+                    if r["ai_description"]:
+                        st.caption("Gemini's picture description:")
+                        st.write(r["ai_description"])
                     note = st.text_area("Moderation note", key=f"note_{r['id']}")
                     approve_col, reject_col = st.columns(2)
                     if approve_col.button("Approve", key=f"approve_{r['id']}"):
@@ -673,13 +903,15 @@ else:
                                 "UPDATE missions SET rating=?, feedback=? WHERE id=?",
                                 (rating, feedback, m["id"]),
                             )
-                        st.success("Saved.")
+                        st.success("Saved. This feeds directly into tomorrow's Gemini-generated exercise.")
 
         with tab_ai:
             st.markdown(
-                "Add a **free** Gemini API key to unlock two features:\n"
-                "- Real picture understanding in the Learning Library (not just OCR text)\n"
-                "- The Homework Helper, which explains solutions step by step\n\n"
+                "Add a **free** Gemini API key to unlock:\n"
+                "- Adaptive, freshly-generated daily exercises (not repeats)\n"
+                "- Real picture understanding in the Learning Library\n"
+                "- The Homework Helper, step-by-step explanations\n"
+                "- Hindi and Kannada exercise generation in native script\n\n"
                 "Get a free key (no credit card) at "
                 "[aistudio.google.com/apikey](https://aistudio.google.com/apikey)."
             )
@@ -694,9 +926,9 @@ else:
                 )
                 new_model = st.text_input(
                     "Model name", value=profile.get("gemini_model") or gemini_helper.DEFAULT_MODEL,
-                    help="Google renames free-tier models periodically. If you get "
-                         "a 'model not found' error, check aistudio.google.com for "
-                         "the current free model name and update it here.",
+                    help="Google renames free-tier models periodically. 'gemini-2.5-flash' is "
+                         "a stable free choice as of Sept 2026. If you get a 'model not found' "
+                         "error, check aistudio.google.com for the current free model name.",
                 )
                 save_col, test_col = st.columns(2)
                 saved = save_col.form_submit_button("💾 Save")
@@ -710,6 +942,18 @@ else:
                         )
                     st.success("Saved. Reloading...")
                     st.rerun()
+
+            st.markdown("---")
+            st.caption(
+                "**Already generated today's missions before adding this key?** "
+                "Today's Mission only generates each slot once per day. Use the "
+                "button below to clear any not-yet-completed missions for today "
+                "so they regenerate using Gemini right away. Completed missions "
+                "and points already earned are kept safe."
+            )
+            if st.button("🔄 Regenerate today's remaining missions"):
+                regenerate_open_missions(date.today())
+                st.success("Done. Open 'Today's Mission' to see the refreshed activities.")
 
                 if tested:
                     key_to_test = new_key or current_key
@@ -736,50 +980,56 @@ else:
         with tab_how:
             st.markdown(
                 """
-### How "Today's Mission" is generated
-Every weekday the app fills 5 slots (English, Numeracy, Hindi/Kannada,
-Drawing, Speaking & Thinking). For each slot it checks:
+### How "Today's Mission" is generated (in priority order)
+For each of the 5 daily slots, the app tries:
+1. **Gemini adaptive generation** (if an API key is configured) - see below.
+2. **Approved uploads rotation** - if Gemini is unavailable, cycles through
+   your approved worksheets for that subject.
+3. **Built-in generic activity bank** - if neither of the above is
+   available, uses a small set of generic CBSE/UKG-style activities so
+   there is always something to do.
 
-1. **Do you have an approved upload for this section?** If yes, it builds
-   the mission around that worksheet's topic.
-2. **If not**, it uses a built-in bank of generic, age-appropriate CBSE/UKG
-   activities, rotated day by day - so there is always something to do,
-   even with zero uploads.
+### How the adaptive Gemini engine actually works
+Every time a mission is generated, the app builds a plain-text summary
+of everything it knows about your child's progress **in that specific
+subject**:
+- Approved worksheet topics, their OCR-extracted text, and Gemini's own
+  picture descriptions (if you used the "describe this picture" button)
+- Your typed **learning notes** ("she can already count to 20...")
+- Her last several **completed missions**, including your star ratings
+  and written feedback
 
-### How the app "reads" your uploaded worksheets
-When you upload a picture or PDF, the app runs **OCR (Tesseract)** to
-extract printed text, then:
-- Detects whether the page is in English, Hindi or Kannada script.
-- Detects simple patterns (lots of digits → numeracy; a big single letter
-  with a few words → phonics/letter page).
-- Suggests a short topic phrase from the most frequent meaningful words.
+This summary is sent to Gemini along with a **level (1-10)** the app
+tracks per subject. Gemini is asked to invent a brand-new activity
+appropriate for that level, and to recommend whether tomorrow's level
+should go up, stay the same, or go down - which the app stores and uses
+the next time. This is a genuine (if simple) feedback loop: your ratings
+and notes really do change what she gets tomorrow.
 
-This is genuine text extraction, not a guess - but it has real limits:
-- It reads **printed text only**. It cannot understand illustrations,
-  photos, or your child's handwriting.
-- Suggested topics can be imperfect on blurry photos or unusual fonts -
-  that's why you always review and edit the topic before approving.
+**Important honesty note:** the "level" is a lightweight heuristic, not
+a scientifically validated learning-progression model. It works best
+when you regularly rate completed missions and jot down learning notes -
+without that input, Gemini can only guess her level from worksheet
+topics alone.
 
-### Real picture understanding (Gemini, optional)
-Once a free Gemini API key is added in **AI Setup**, two things change:
-- In the Learning Library, an extra button lets Gemini actually *look at*
-  the picture - describing illustrations, not just reading printed text -
-  and suggests a topic and follow-up questions.
-- The **Homework Helper** tab lets you upload a homework question and get
-  a step-by-step, age-appropriate explanation (not just a bare answer),
-  a final answer to check against, a similar practice question, and one
-  encouraging line to say to your child.
+### Hindi and Kannada
+Gemini is a multilingual model with strong support for Indian languages.
+When generating Hindi or Kannada activities, the app explicitly asks for
+native-script text (Devanagari / Kannada script) with an English
+translation alongside for the parent. As with any AI-generated language
+content, please review it - occasional phrasing quirks are possible,
+and a parent's judgment is the final check.
 
-**Good to know:**
-- Uses your own free Google API key and free quota - nothing is charged
-  unless you separately enable billing on your Google account.
-- Free tier has daily/per-minute limits (Google adjusts these
-  periodically). Normal home use - a few uploads a day - stays well
-  within them.
-- Google's free tier may use these inputs to improve their products.
-  Avoid uploading your child's full name, school ID, address, or other
-  children's faces.
-- The Homework Helper is designed to help *you* teach the concept, not
-  to generate answers for your child to copy directly as their own work.
+### What OCR alone can and cannot do
+OCR (Tesseract) reads **printed text only** - it cannot understand
+illustrations, photos, or handwriting. That gap is why the Gemini
+picture-description button exists in the Learning Library.
+
+### Free tier reality check
+Gemini's free tier (via your own API key) has daily/per-minute limits
+that Google adjusts periodically. Normal home use - a handful of calls
+per day across 5 mission slots plus occasional homework help - comfortably
+fits within free limits as of September 2026. If you ever see a "quota"
+or "429" error, wait a few minutes and try again.
                 """
             )
